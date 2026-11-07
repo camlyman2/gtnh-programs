@@ -15,6 +15,9 @@
     File Explorer  This PC > Archive > source > year > month > day files.
                    Open a file to see its graph (min/max band + average)
                    and data table, or the cycle log for a month.
+                   Gaps = time between charging cycles (like gtgraphs).
+                   Storage Report = what is stored, how fast it grows,
+                   and when the drives would be full.
     My Computer    storage, memory, power and hardware details
     Settings       your name, system name, lock screen, desktop color,
                    how long full-detail samples are kept
@@ -25,6 +28,7 @@
     archive/LSC Power/2026/2026-11.q15         15-minute average/min/max
     archive/Tree Farm/...                      same layout
     archive/LSC Cycles/2026/2026-11.cyc        one line per charging cycle
+                                               (incl. the idle gap before it)
   Full-detail .raw files are deleted after a few days (Settings). When the
   drives get full the oldest .raw, then .min, then .q15 files go first.
   Cycle logs are never deleted automatically.
@@ -755,7 +759,7 @@ local function writeText(rel, p)
   local isNew = not filesystem.exists(full)
   local f = io.open(full, "a")
   if not f then lastError = "Can't write " .. full; return end
-  if isNew then f:write("# Lymanos Archive cycle log: id start stop seconds rate_L/s nitrobenzene_L\n") end
+  if isNew then f:write("# Lymanos Archive cycle log: id start stop seconds rate_L/s nitrobenzene_L gap_s\n") end
   f:write(data)
   f:close()
   remember(rel, d)
@@ -885,6 +889,13 @@ local cycleTotal, lastCycle = 0, nil
 local stats = { at = nil, snap = nil, from = nil, dist = nil }
 local function cycleKey(start) return string.format("%.0f", start) end
 
+-- two cycles count as back-to-back (so the idle time between them is a real
+-- "time between cycles") when their numbers follow on, or have no numbers
+local function gapPair(a, b)
+  local ia, ib = tonumber(a.id), tonumber(b.id)
+  return not (ia and ib) or ib == ia + 1
+end
+
 local function onStats(from, dist, payload)
   local s = unpackPayload(payload)
   if not s then return false end
@@ -892,17 +903,26 @@ local function onStats(from, dist, payload)
   senderClockOK = s.clockOK ~= false
   if not senderClockOK then return false end
   local added = false
+  local list = {}
   for _, c in ipairs(s.cycles or {}) do
-    if type(c.start) == "number" and c.stop then
-      local k = cycleKey(c.start)
-      if not seen[k] then
-        seen[k] = true
-        queueLine(relOf(CYC_SRC, "cyc", c.start), string.format("%s %.3f %.3f %.0f %.6g %.0f\n",
-          tostring(c.id or "-"), c.start, c.stop, c.dur or (c.stop - c.start), c.rate or 0, c.used or 0))
-        cycleTotal = cycleTotal + 1
-        if not lastCycle or c.start > lastCycle.start then lastCycle = c end
-        added = true
+    if type(c.start) == "number" and c.stop then list[#list + 1] = c end
+  end
+  table.sort(list, function(a, b) return a.start < b.start end)
+  for _, c in ipairs(list) do
+    local k = cycleKey(c.start)
+    if not seen[k] then
+      seen[k] = true
+      -- idle time since the previous charge ended (the "time between cycles")
+      local gap = "-"
+      local p = lastCycle
+      if p and p.stop and c.start > p.start and c.start > p.stop and gapPair(p, c) then
+        gap = string.format("%.0f", c.start - p.stop)
       end
+      queueLine(relOf(CYC_SRC, "cyc", c.start), string.format("%s %.3f %.3f %.0f %.6g %.0f %s\n",
+        tostring(c.id or "-"), c.start, c.stop, c.dur or (c.stop - c.start), c.rate or 0, c.used or 0, gap))
+      cycleTotal = cycleTotal + 1
+      if not lastCycle or c.start > lastCycle.start then lastCycle = c end
+      added = true
     end
   end
   return added
@@ -1084,14 +1104,15 @@ local function readCycles(t0, t1)
       local k = 0
       for line in f:lines() do
         if line:sub(1, 1) ~= "#" then
-          local id, st, sp, du, ra, us = line:match("^(%S+) (%S+) (%S+) (%S+) (%S+) (%S+)")
+          local id, st, sp, du, ra, us, gp = line:match("^(%S+) (%S+) (%S+) (%S+) (%S+) (%S+) ?(%S*)")
           st = tonumber(st)
           if st and (not t0 or (st >= t0 and st < t1)) then
             local key = cycleKey(st)
             if not keys[key] then
               keys[key] = true
               list[#list + 1] = { id = tonumber(id) or id, start = st, stop = tonumber(sp),
-                                  dur = tonumber(du) or 0, rate = tonumber(ra) or 0, used = tonumber(us) or 0 }
+                                  dur = tonumber(du) or 0, rate = tonumber(ra) or 0, used = tonumber(us) or 0,
+                                  gap = tonumber(gp) }
             end
           end
         end
@@ -1103,6 +1124,22 @@ local function readCycles(t0, t1)
   end
   table.sort(list, function(a, b) return a.start < b.start end)
   return list
+end
+
+-- idle gaps ("time between cycles") for a cycle list, oldest first.
+-- Uses the gap saved in the log when there is one (that also covers the
+-- first cycle of a month, whose previous cycle is in last month's file).
+local function gapsOf(list)
+  local out = {}
+  for i, c in ipairs(list) do
+    local g = c.gap
+    local p = list[i - 1]
+    if not g and p and p.stop and c.start > p.stop and gapPair(p, c) then g = c.start - p.stop end
+    if g and g > 0 then
+      out[#out + 1] = { id = c.id, gap = g, start = c.start, prevStop = c.start - g, cycle = c }
+    end
+  end
+  return out
 end
 
 -- earliest day with data for a source folder (UTC time of its midnight)
@@ -1241,6 +1278,95 @@ local function usage()
   return out
 end
 
+-- number of records in one archive file (exact for binary, estimated for text)
+local function countRecords(full, size)
+  local f = io.open(full, "rb")
+  if not f then return 0, false end
+  local head = f:read(4)
+  local n, exact = 0, true
+  if head == "LZB1" then
+    local h2 = f:read(2) or "\0\0"
+    local nf, tc = h2:byte(1) or 0, h2:byte(2) or 0
+    n = floor((size - 6) / recSize(nf, tc == 1))
+  else
+    local sample = (head or "") .. (f:read(4092) or "")
+    local lines, hl = 0, 0
+    for line in sample:gmatch("([^\n]*)\n") do
+      lines = lines + 1
+      if lines == 1 and (line:sub(1, 4) == "LZT1" or line:sub(1, 1) == "#") then hl = #line + 1 end
+    end
+    if #sample >= size then
+      n = lines - (hl > 0 and 1 or 0)                                   -- whole file read
+    elseif lines > 1 then
+      n = floor((size - hl) / ((#sample - hl) / (lines - (hl > 0 and 1 or 0))) + 0.5)
+      exact = false
+    end
+  end
+  f:close()
+  return max(0, n), exact
+end
+
+-- everything the Storage Report shows
+local function report()
+  flush()
+  local t = now()
+  local today = dkey(t)
+  local yesterday = dkey(t - 86400)
+  local rows = {}
+  local perDay = { raw = 0, min = 0, q15 = 0, cyc = 0 }
+  local function scan(folder, ext, label, graphs)
+    local r = { folder = folder, ext = ext, label = label, graphs = graphs,
+                files = 0, bytes = 0, records = 0, exact = true }
+    local todayB, yestB = 0, 0
+    for _, f in ipairs(allFiles(folder, ext)) do
+      local sz = filesystem.size(f.full) or 0
+      r.files, r.bytes = r.files + 1, r.bytes + sz
+      if ext ~= "cyc" then
+        local n, ex = countRecords(f.full, sz)
+        r.records = r.records + n
+        if not ex then r.exact = false end
+      end
+      if not r.from or f.base < r.from then r.from = f.base end
+      if not r.to or f.base > r.to then r.to = f.base end
+      if f.base == yesterday then yestB = yestB + sz end
+      if f.base == today then todayB = todayB + sz end
+      breathe()
+    end
+    -- bytes added per day: yesterday's files, or today's so far scaled up
+    if ext == "raw" or ext == "min" then
+      local e = toEastern(t)
+      local frac = (e.hour * 3600 + e.min * 60 + e.sec) / 86400
+      local rate = (yestB > 0) and yestB or ((frac > 0.04) and todayB / frac or 0)
+      perDay[ext] = perDay[ext] + rate
+    elseif ext == "q15" then
+      local e = toEastern(t)
+      local mine = 0
+      for _, f in ipairs(allFiles(folder, ext)) do
+        if f.base == today:sub(1, 7) then mine = mine + (filesystem.size(f.full) or 0) end
+      end
+      local elapsed = (e.day - 1) + (e.hour * 3600 + e.min * 60) / 86400
+      if elapsed > 0.04 then perDay.q15 = perDay.q15 + mine / elapsed end
+    end
+    rows[#rows + 1] = r
+    return r
+  end
+  for _, src in ipairs(SOURCES) do
+    for _, ext in ipairs({ "raw", "min", "q15" }) do scan(src.folder, ext, TIERS[ext].label, #src.fields) end
+  end
+  local cr = scan(CYCLE_FOLDER, "cyc", TIERS.cyc.label, 2)
+  local cycles = readCycles(nil)
+  cr.records = #cycles
+  local gaps = gapsOf(cycles)
+  local total, free, usable = 0, 0, 0
+  for _, d in ipairs(drives) do
+    freeOf(d)
+    total, free = total + d.total, free + max(0, d.free)
+    usable = usable + max(0, d.free - reserve())
+  end
+  return { at = t, rows = rows, cycles = #cycles, gaps = #gaps, perDay = perDay,
+           total = total, free = free, usable = usable, firstCycle = cycles[1] }
+end
+
 ------------------------------------------------------------- STARTUP / TICK
 local up0 = computer.uptime()
 local nextFlush, nextScan, nextClean = up0 + CONFIG.FLUSH_SECONDS, up0 + 30, up0 + 90
@@ -1293,6 +1419,7 @@ return {
   onFuel = onFuel, onFarm = onFarm, onStats = onStats,
   start = start, tick = tick, flush = flush, finalFlush = finalFlush, cleanup = cleanup, usage = usage,
   aggregate = aggregate, readCycles = readCycles, firstTime = firstTime, fileInfo = fileInfo,
+  gapsOf = gapsOf, report = report,
   forget = function() where, whereCount = {}, 0 end,
   live = live, stats = stats, fresh = fresh, rawDays = rawDays, reserve = reserve,
   info = function()
@@ -1674,8 +1801,9 @@ local X0, CW = WX + 1, WW - 2
 local TB = WY + 3                 -- toolbar (3 rows)
 local HY = WY + 6                 -- dark header strip
 local SY = WY + WH - 2            -- status bar
-local kind = nil                  -- "graph" | "cycles" | "text" | nil
+local kind = nil                  -- "graph" | "cycles" | "gaps" | "report" | "text" | nil
 local backFn = nil
+local gapsFromCycles              -- set below (cycle log -> gap graph of the same month)
 
 local function back()
   kind = nil
@@ -2284,6 +2412,8 @@ local function drawCycles()
     { "This Month", 14, function() openCycles(); drawAll() end, not cy.all },
     { "All Time", 12, function() cy.all = true; cy.sel = nil; loadCycles(); drawAll() end, cy.all },
     { "Refresh", 11, function() loadCycles(); drawAll() end },
+    "gap",
+    { "Time Between Cycles", 23, function() gapsFromCycles() end },
   })
   fill(X0, HY, CW, 1, G.header)
   text(X0 + 1, HY, "≡ LSC CYCLES · " .. periodText(), G.accent, G.header)
@@ -2366,10 +2496,449 @@ local function drawText()
   status98({ statusMsg, #tv.lines .. " lines", "line " .. (tv.scroll + 1) })
 end
 
+-------------------------------------------------- TIME BETWEEN CYCLES
+-- gtgraphs' "charge gaps" graph with the whole archive behind it: idle
+-- time from the end of one charge to the start of the next (how long a
+-- full charge lasts). Bars are colored against the average; a dashed line
+-- marks the average, a solid line the trend; the hatched bar is now.
+local GAPC = 0xFF8A3D
+local gp = { mode = "last", count = 50, y = nil, m = nil, list = {}, sel = nil, scroll = 0, live = nil }
+local GGY, GGROWS = HY + 2, 18                -- chart rows (36 pixels)
+local GTH = GGY + GGROWS + 3                  -- table header row
+local GTR = SY - GTH - 1                      -- table rows
+
+local function gapPeriod()
+  if gp.mode == "all" then return "ALL TIME" end
+  if gp.mode == "last" then return "LAST " .. gp.count .. " GAPS" end
+  return (UI.MONTHS[gp.m] or "?"):upper() .. " " .. gp.y
+end
+
+local function loadGaps()
+  local cycles
+  if gp.mode == "month" then
+    local ny, nm = (gp.m == 12) and gp.y + 1 or gp.y, gp.m % 12 + 1
+    cycles = ARC.readCycles(easternMidnight(gp.y, gp.m, 1), easternMidnight(ny, nm, 1))
+  else
+    cycles = ARC.readCycles(nil)
+  end
+  local all = ARC.gapsOf(cycles)
+  if gp.mode == "last" then
+    local cut = {}
+    for i = max(1, #all - gp.count + 1), #all do cut[#cut + 1] = all[i] end
+    all = cut
+  end
+  gp.list = all
+  gp.scroll = 0
+  -- idle right now? (only when the period reaches today)
+  gp.live = nil
+  local inNow = gp.mode ~= "month"
+  if gp.mode == "month" then
+    local e = toEastern(now())
+    inNow = (e.year == gp.y and e.month == gp.m)
+  end
+  local L, S = ARC.live.lsc, ARC.stats
+  local charging
+  if L and ARC.fresh(L.at) then charging = (L.flags or 0) > 0
+  elseif S.snap and ARC.fresh(S.at) then charging = S.snap.signalOn and true or false end
+  local lastStop = (S.snap and S.snap.lastStop) or (cycles[#cycles] and cycles[#cycles].stop)
+  if inNow and charging == false and lastStop then gp.live = max(0, now() - lastStop) end
+  -- stats + least-squares trend (seconds gained/lost per cycle)
+  local n, sum, mn, mx = #all, 0, math.huge, 0
+  for _, g in ipairs(all) do sum = sum + g.gap; mn = min(mn, g.gap); mx = max(mx, g.gap) end
+  gp.n, gp.avg, gp.mn, gp.mx = n, n > 0 and sum / n or nil, n > 0 and mn or nil, n > 0 and mx or nil
+  gp.slope, gp.icept = nil, nil
+  if n >= 3 then
+    local sx, sy, sxx, sxy = 0, 0, 0, 0
+    for i, g in ipairs(all) do sx, sy, sxx, sxy = sx + i, sy + g.gap, sxx + i * i, sxy + i * g.gap end
+    local d = n * sxx - sx * sx
+    if d ~= 0 then
+      gp.slope = (n * sxy - sx * sy) / d
+      gp.icept = (sy - gp.slope * sx) / n
+    end
+  end
+  if gp.sel then
+    local ok = false
+    for _, g in ipairs(all) do if g.start == gp.sel then ok = true end end
+    if not ok then gp.sel = nil end
+  end
+end
+
+local function openGaps(mode, y, m)
+  kind = "gaps"
+  if mode then gp.mode = mode end
+  if y then gp.y, gp.m = y, m end
+  if gp.mode == "month" and not gp.y then
+    local e = toEastern(now())
+    gp.y, gp.m = e.year, e.month
+  end
+  gp.sel = nil
+  loadGaps()
+end
+
+local function gapStep(d)
+  if gp.mode ~= "month" then
+    local e = toEastern(now())
+    gp.y, gp.m = e.year, e.month
+    gp.mode = "month"
+    if d < 0 then d = 0 end
+  end
+  local k = gp.y * 12 + (gp.m - 1) + d
+  gp.y, gp.m = floor(k / 12), k % 12 + 1
+  loadGaps(); drawAll()
+end
+
+local function axisDur(s)
+  s = max(0, floor(s + 0.5))
+  if s < 60 then return s .. "s" end
+  if s < 3600 then return string.format("%dm %02ds", floor(s / 60), s % 60) end
+  if s < 86400 then return string.format("%dh %02dm", floor(s / 3600), floor(s % 3600 / 60)) end
+  return string.format("%dd %02dh", floor(s / 86400), floor(s % 86400 / 3600))
+end
+
+local function ratioColor(r)
+  if r >= 0.9 then return G.good elseif r >= 0.7 then return G.warn end
+  return G.bad
+end
+
+local function trendInfo()
+  if not (gp.slope and gp.avg and gp.avg > 0) then return "needs 3+ gaps", G.dim end
+  local pct = gp.slope / gp.avg
+  if pct < -0.03 then return "-" .. axisDur(math.abs(gp.slope)) .. "/cycle ▼ SHRINKING", G.bad end
+  if pct > 0.03 then return "+" .. axisDur(gp.slope) .. "/cycle ▲ GROWING", G.good end
+  return "STABLE", G.text
+end
+
+local function selectedGap()
+  if not gp.sel then return nil end
+  for i, g in ipairs(gp.list) do if g.start == gp.sel then return g, i end end
+end
+
+local function drawGapStats()
+  local tt, tc = trendInfo()
+  local g = selectedGap()
+  if g then
+    UI.segs(X0, HY + 1, CW, {
+      { " SELECTED ", G.accent }, { "before cycle #" .. tostring(g.id or "?") .. "   ", G.text },
+      { "IDLE ", G.dim }, { fmtDurLong(g.gap) .. "   ", GAPC },
+      { "VS AVG ", G.dim }, { gp.avg and (floor(g.gap / gp.avg * 100 + 0.5) .. "%   ") or "--   ", ratioColor(gp.avg and g.gap / gp.avg or 1) },
+      { "ENDED ", G.dim }, { UI.stamp(g.prevStop) .. "  ", G.text },
+      { "NEXT ", G.dim }, { UI.stamp(g.start), G.text } }, gp.n .. " gaps ", G.panel)
+  else
+    UI.segs(X0, HY + 1, CW, {
+      { " LATEST ", G.dim }, { gp.n > 0 and fmtDurLong(gp.list[gp.n].gap) or "--", GAPC },
+      { "   AVG ", G.dim }, { gp.avg and fmtDurLong(gp.avg) or "--", G.text },
+      { "   MIN ", G.dim }, { gp.mn and fmtDurLong(gp.mn) or "--", G.text },
+      { "   MAX ", G.dim }, { gp.mx and fmtDurLong(gp.mx) or "--", G.text },
+      { "   TREND ", G.dim }, { tt, tc },
+      { gp.live and ("   IDLE NOW " .. fmtDurLong(gp.live)) or "", G.accent } },
+      gp.n .. " gaps ", G.panel)
+  end
+end
+
+local function drawGapChart()
+  local list, n = gp.list, #gp.list
+  local cw, ph = NCOL, GGROWS * 2
+  fill(X0, GGY, CW, GGROWS + 3, G.panel)
+  local ymax = UI.niceMax(max(gp.mx or 0, gp.live or 0, 60) * 1.1)
+  local function py(v) return ph - 1 - floor(v / ymax * (ph - 3) + 0.5) end
+  local cv = newCanvas(cw, ph, G.panel)
+  for k = 1, 4 do
+    local yy = py(ymax * k / 4)
+    for xx = 3, cw, 3 do cset(cv, xx, yy, G.grid) end
+  end
+  -- bars: one per gap while they fit, else groups of gaps (bar = group average)
+  local nb = n + (gp.live and 1 or 0)
+  local slotW, per = 1, 1
+  if nb > 0 then
+    slotW = min(10, floor((cw - 2) / max(nb, 6)))
+    if slotW < 1 then slotW, per = 1, ceil(nb / (cw - 2)) end
+  end
+  local barW = slotW >= 4 and slotW - 2 or (slotW >= 2 and slotW - 1 or 1)
+  local function barX(i) return 3 + (i - 1) * slotW end
+  gp.slotW, gp.per, gp.barX0 = slotW, per, 3
+  local groups = ceil(n / per)
+  local selG = nil
+  local sg, si = selectedGap()
+  if si then selG = ceil(si / per) end
+  for gi = 1, groups do
+    local a, b = (gi - 1) * per + 1, min(n, gi * per)
+    local s, hi = 0, 0
+    for i = a, b do s = s + list[i].gap; hi = max(hi, list[i].gap) end
+    local v = s / (b - a + 1)
+    local col = (gi == selG) and 0xFFFFFF or ratioColor(gp.avg and v / gp.avg or 1)
+    local yt, yh = py(v), py(hi)
+    local top = lerp(col, 0xFFFFFF, 0.4)
+    for xx = barX(gi), barX(gi) + barW - 1 do
+      if per > 1 then for yy = yh, yt - 1 do cset(cv, xx, yy, lerp(col, G.panel, 0.7)) end end
+      cset(cv, xx, yt, top)
+      for yy = yt + 1, ph - 1 do cset(cv, xx, yy, lerp(col, G.panel, 0.05 + 0.6 * (yy - yt) / max(1, ph - 1 - yt))) end
+    end
+  end
+  if gp.live then
+    local i = groups + 1
+    local yt = py(gp.live)
+    local hatch = lerp(G.accent, G.panel, 0.45)
+    for xx = barX(i), barX(i) + barW - 1 do
+      cset(cv, xx, yt, G.accent)
+      for yy = yt + 1, ph - 1 do if (yy - yt) % 2 == 0 then cset(cv, xx, yy, hatch) end end
+    end
+  end
+  if gp.avg then
+    local yy = py(gp.avg)
+    for xx = 2, cw do if xx % 4 < 2 then cset(cv, xx, yy, G.dim) end end
+  end
+  local tt, tc = trendInfo()
+  if gp.slope and n >= 3 then
+    local function cx(i) return barX(ceil(i / per)) + floor(barW / 2) end
+    cline(cv, cx(1), py(max(0, gp.icept + gp.slope)), cx(n), py(max(0, gp.icept + gp.slope * n)), tc)
+  end
+  for yy = 1, ph do cset(cv, 1, yy, G.axis) end
+  for xx = 1, cw do cset(cv, xx, ph, G.axis) end
+  crender(cv, GX, GGY)
+  for k = 0, 4 do
+    local lv = ymax * k / 4
+    textW(X0, GGY + floor((py(lv) - 1) / 2), LABW, axisDur(lv), G.dim, G.panel, "right")
+  end
+  if nb == 0 then
+    textW(GX, GGY + 7, cw, "No gaps yet - it takes two back-to-back charging cycles.", G.dim, G.panel, "center")
+  end
+  -- labels under the bars: cycle numbers + idle times when there is room, else dates
+  local ly = GGY + GGROWS
+  local ids, durs = {}, {}
+  if slotW >= 5 then
+    local maxLab = slotW - 1
+    for i, g in ipairs(list) do
+      ids[#ids + 1] = { barX(i) + floor(barW / 2), ("#" .. tostring(g.id or "?")):sub(1, maxLab) }
+      durs[#durs + 1] = { barX(i) + floor(barW / 2), UI.fmtShort(g.gap):sub(1, maxLab) }
+    end
+    if gp.live then
+      ids[#ids + 1] = { barX(groups + 1) + floor(barW / 2), ("now"):sub(1, maxLab) }
+      durs[#durs + 1] = { barX(groups + 1) + floor(barW / 2), UI.fmtShort(gp.live):sub(1, maxLab) }
+    end
+    textW(X0, ly, LABW, "cycle", G.dim, G.panel, "right")
+    text(GX, ly, UI.labelRow(cw, ids), G.text, G.panel)
+    textW(X0, ly + 1, LABW, "idle", G.dim, G.panel, "right")
+    text(GX, ly + 1, UI.labelRow(cw, durs), GAPC, G.panel)
+  elseif groups > 0 then
+    for k = 0, 4 do
+      local gi = max(1, min(groups, 1 + floor((groups - 1) * k / 4)))
+      ids[#ids + 1] = { barX(gi), UI.dateOnly(list[(gi - 1) * per + 1].start, true) }
+    end
+    textW(X0, ly, LABW, "date", G.dim, G.panel, "right")
+    text(GX, ly, UI.labelRow(cw, ids), G.dim, G.panel)
+    textW(GX, ly + 1, cw, per > 1 and ("each bar = " .. per .. " gaps (average, lighter top = longest)") or
+      (n .. " gaps, oldest on the left"), G.dim, G.panel)
+  end
+  UI.segs(X0 + 2, ly + 2, CW - 4, {
+    { "■", G.good }, { " >=90% of avg  ", G.dim }, { "■", G.warn }, { " 70-90%  ", G.dim },
+    { "■", G.bad }, { " <70%  ", G.dim }, { "▒", G.accent }, { " idle now  ", G.dim },
+    { "/", tc }, { " trend  ", G.dim }, { "--", G.dim }, { " avg      click a bar or a row to select it", G.dim } })
+end
+
+local GCOLS = { { "BEFORE CYCLE", 13 }, { "CHARGE ENDED", 18 }, { "NEXT CHARGE STARTED", 20 },
+                { "IDLE TIME", 15 }, { "VS AVG", 8 }, { "THAT CYCLE", 14 }, { "NB USED", 14 } }
+
+local function drawGapTable()
+  fill(X0, GTH, CW, 1, G.header)
+  local cx = X0 + 1
+  for i, col in ipairs(GCOLS) do
+    textW(cx, GTH, col[2], col[1], G.dim, G.header, i >= 4 and "right" or nil)
+    cx = cx + col[2] + 2
+  end
+  local list, n = gp.list, #gp.list
+  local maxS = max(0, n - GTR)
+  gp.scroll = max(0, min(gp.scroll, maxS))
+  for r = 1, GTR do
+    local g = list[n - gp.scroll - r + 1]
+    local y = GTH + r
+    if g then
+      local sel = g.start == gp.sel
+      local b = sel and G.button or ((r % 2 == 0) and 0x1B1B1B or G.panel)
+      local ratio = gp.avg and g.gap / gp.avg or 1
+      local c = g.cycle or {}
+      local cells = { "#" .. tostring(g.id or "?"), UI.stampSec(g.prevStop), UI.stampSec(g.start),
+                      fmtDurLong(g.gap), floor(ratio * 100 + 0.5) .. "%", c.dur and fmtDurLong(c.dur) or "--",
+                      c.used and shortL(c.used) .. " L" or "--" }
+      local colors = { G.accent, G.text, G.text, GAPC, ratioColor(ratio), G.dim, G.nb }
+      cx = X0 + 1
+      fill(X0, y, 1, 1, b)
+      for i, col in ipairs(GCOLS) do
+        textW(cx, y, col[2] + 2, cells[i] .. "  ", colors[i], b, i >= 4 and "right" or nil)
+        cx = cx + col[2] + 2
+      end
+      fill(cx, y, X0 + CW - 1 - cx, 1, b)
+    else
+      fill(X0, y, CW - 1, 1, G.panel)
+    end
+  end
+  UI.scrollbar(X0 + CW - 1, GTH + 1, GTR, gp.scroll, maxS)
+end
+
+local function pickGap(g)
+  gp.sel = (g and gp.sel ~= g.start) and g.start or nil
+  local _, i = selectedGap()
+  if i then
+    local row = #gp.list - i + 1
+    if row <= gp.scroll or row > gp.scroll + GTR then gp.scroll = max(0, row - floor(GTR / 2)) end
+  end
+  drawGapStats(); drawGapChart(); drawGapTable()
+end
+
+local function drawGaps()
+  toolbar({
+    { "◄ Back", 10, back },
+    "gap",
+    { "Last 12", 11, function() gp.mode, gp.count = "last", 12; gp.sel = nil; loadGaps(); drawAll() end, gp.mode == "last" and gp.count == 12 },
+    { "Last 50", 11, function() gp.mode, gp.count = "last", 50; gp.sel = nil; loadGaps(); drawAll() end, gp.mode == "last" and gp.count == 50 },
+    { "◄ Month", 11, function() gapStep(-1) end },
+    { "Month ►", 11, function() gapStep(1) end },
+    { "All Time", 12, function() gp.mode = "all"; gp.sel = nil; loadGaps(); drawAll() end, gp.mode == "all" },
+    { "Refresh", 11, function() loadGaps(); drawAll() end },
+    "gap",
+    { "Cycle Log", 13, function() openCycles(); drawAll() end },
+  })
+  fill(X0, HY, CW, 1, G.header)
+  text(X0 + 1, HY, "≡ TIME BETWEEN CHARGING CYCLES · " .. gapPeriod(), GAPC, G.header)
+  textW(X0 + CW - 46, HY, 45, "idle time a full charge lasts", G.dim, G.header, "right")
+  drawGapStats()
+  drawGapChart()
+  region(regions, GX, GGY, NCOL, GGROWS, function(px)
+    local gi = floor((px - GX + 1 - (gp.barX0 or 3)) / (gp.slotW or 1)) + 1
+    local i = (gi - 1) * (gp.per or 1) + 1
+    local g = gp.list[max(1, min(#gp.list, i))]
+    if g and gi >= 1 and gi <= ceil(#gp.list / (gp.per or 1)) then pickGap(g) end
+  end)
+  drawGapTable()
+  for r = 1, GTR do
+    region(regions, X0, GTH + r, CW - 1, 1, function()
+      local g = gp.list[#gp.list - gp.scroll - r + 1]
+      if g then pickGap(g) end
+    end)
+  end
+  region(regions, X0 + CW - 1, GTH + 1, 1, 1, function() gp.scroll = gp.scroll - 1; drawGapTable() end)
+  region(regions, X0 + CW - 1, GTH + GTR, 1, 1, function() gp.scroll = gp.scroll + 1; drawGapTable() end)
+  status98({ statusMsg, gp.n .. " gaps shown", gapPeriod():lower(),
+    "logged in the cycle log (" .. ARC.CYCLE_FOLDER .. "), never deleted" })
+end
+
+gapsFromCycles = function()
+  if cy.all then openGaps("all") else openGaps("month", cy.y, cy.m) end
+  drawAll()
+end
+
+------------------------------------------------------- STORAGE REPORT
+local rp = nil          -- last computed report
+
+local function openReport()
+  kind = "report"
+  statusMsg = "Reading the archive..."
+  rp = ARC.report()
+  statusMsg = "Ready"
+end
+
+local function bar(x, y, w, frac, col)
+  local n = max(0, min(w, floor(w * frac + 0.5)))
+  text(x, y, string.rep("█", n), col, G.track)
+  if w - n > 0 then text(x + n, y, string.rep("░", w - n), G.grid, G.track) end
+end
+
+local KEPT = { raw = nil, min = "until space is needed", q15 = "years (deleted last)", cyc = "forever" }
+
+local function drawReport()
+  toolbar({ { "◄ Back", 10, back }, "gap", { "Refresh", 11, function() openReport(); drawAll() end } })
+  fill(X0, HY, CW, 1, G.header)
+  text(X0 + 1, HY, "≡ STORAGE REPORT", G.accent, G.header)
+  textW(X0 + CW - 40, HY, 39, "computed " .. UI.stampSec(rp.at), G.dim, G.header, "right")
+  fill(X0, HY + 1, CW, SY - HY - 1, G.bg)
+  -- drives
+  local drives = ARC.drives()
+  local dh = min(#drives, 6) + 3
+  UI.panel(X0, HY + 1, CW, dh, "ARCHIVE DRIVES", G.accent, #drives .. " drive(s) ")
+  for i, d in ipairs(drives) do
+    if i > 6 then break end
+    local y = HY + 2 + i
+    local used = d.total - max(0, d.free)
+    local frac = d.total > 0 and used / d.total or 0
+    textW(X0 + 2, y, 6, d.letter .. ":", G.text, G.panel)
+    bar(X0 + 8, y, 60, frac, frac > 0.9 and G.bad or (frac > 0.75 and G.warn or G.good))
+    textW(X0 + 70, y, CW - 72, string.format("%s used of %s   (%s free, %d%% full)", humanBytes(used),
+      humanBytes(d.total), humanBytes(max(0, d.free)), floor(frac * 100 + 0.5)), G.text, G.panel)
+  end
+  if #drives == 0 then textW(X0 + 2, HY + 3, CW - 4, "No archive drives found - add a hard drive to the server.", G.bad, G.panel) end
+  -- what is stored
+  local ty = HY + 1 + dh + 1
+  local rows = rp.rows
+  local th = #rows + 5
+  UI.panel(X0, ty, CW, th, "WHAT IS STORED", G.nb, "one row per log; every graph of a source reads the same entries ")
+  local cols = { { "LOG", 12 }, { "DETAIL", 20 }, { "GRAPHS", 7 }, { "FILES", 6 }, { "ENTRIES", 13 },
+                 { "OLDEST", 11 }, { "NEWEST", 11 }, { "SIZE", 10 }, { "KEPT", 24 } }
+  local cx = X0 + 2
+  for i, c in ipairs(cols) do
+    textW(cx, ty + 1, c[2], c[1], G.dim, G.panel, (i >= 3 and i <= 5 or i == 8) and "right" or nil)
+    cx = cx + c[2] + 2
+  end
+  local last
+  for r, row in ipairs(rows) do
+    local y = ty + 1 + r
+    local entries = (row.exact and "" or "~") .. commas(row.records) .. (row.ext == "cyc" and " cyc" or "")
+    local kept = KEPT[row.ext] or (ARC.rawDays() .. " days (Settings)")
+    local cells = { row.folder ~= last and row.folder or "", row.label, tostring(row.graphs), tostring(row.files),
+                    entries, row.from or "--", row.to or "--", humanBytes(row.bytes), kept }
+    last = row.folder
+    cx = X0 + 2
+    for i, c in ipairs(cols) do
+      textW(cx, y, c[2], cells[i], i == 1 and G.accent or (i == 5 and G.nb or G.text), G.panel,
+        (i >= 3 and i <= 5 or i == 8) and "right" or nil)
+      cx = cx + c[2] + 2
+    end
+  end
+  local gy = ty + 2 + #rows
+  UI.segs(X0 + 2, gy, CW - 4, { { "Time between cycles", G.accent },
+    { "   " .. commas(rp.gaps) .. " gaps, worked out from the " .. commas(rp.cycles) .. " archived cycles", G.text },
+    { "   (each new cycle line also stores its gap)", G.dim } })
+  UI.segs(X0 + 2, gy + 1, CW - 4, { { "~ = estimated from the file size (text files)", G.dim } })
+  -- will it fill up?
+  local fy = ty + th + 1
+  local fh = SY - fy
+  UI.panel(X0, fy, CW, fh, "WILL IT FILL UP?", G.good)
+  local pd = rp.perDay
+  local longTerm = pd.min + pd.q15
+  local lines = {}
+  local function L(segs) lines[#lines + 1] = segs end
+  L({ { "New data per day:  ", G.dim }, { humanBytes(pd.raw + pd.min + pd.q15), G.text },
+      { string.format("   (5-second %s, 1-minute %s, 15-minute %s)", humanBytes(pd.raw), humanBytes(pd.min), humanBytes(pd.q15)), G.dim } })
+  L({ { "5-second files are kept " .. ARC.rawDays() .. " days, so they level off at about ", G.dim },
+      { humanBytes(pd.raw * ARC.rawDays()), G.text }, { " and stop growing.", G.dim } })
+  if longTerm > 0 then
+    local days = rp.usable / longTerm
+    local full = now() + days * 86400
+    L({ { "Long-term growth (1-min + 15-min): ", G.dim }, { humanBytes(longTerm) .. "/day", G.text },
+        { "   free for it: ", G.dim }, { humanBytes(rp.usable), G.text },
+        { "   → full in about ", G.dim }, { floor(days + 0.5) .. " days", days < 14 and G.warn or G.good },
+        { " (" .. UI.dateOnly(full, true) .. ")", G.dim } })
+    if pd.q15 > 0 then
+      L({ { "15-minute history alone would fit about ", G.dim },
+          { string.format("%.1f years", rp.total / pd.q15 / 365), G.text }, { " on these drives.", G.dim } })
+    end
+  else
+    L({ { "Not enough data yet to measure the daily growth - check back after a day of recording.", G.dim } })
+  end
+  L({ { "It can't overflow: ", G.good }, { "every drive always keeps " .. humanBytes(ARC.reserve()) .. " free, checked before every write.", G.text } })
+  L({ { "When space runs short, the oldest 5-second files are deleted first, then 1-minute, then 15-minute files.", G.text } })
+  L({ { "More room: add a hard drive or a RAID block - it is picked up automatically within 30 seconds.", G.dim } })
+  for i, segs in ipairs(lines) do
+    if i > fh - 2 then break end
+    UI.segs(X0 + 2, fy + 1 + i, CW - 4, segs)
+  end
+  status98({ statusMsg, commas(rp.cycles) .. " cycles", humanBytes(rp.free) .. " free on archive drives" })
+end
+
 ------------------------------------------------------------- COMMON
 local function draw()
   if kind == "graph" then drawGraph()
   elseif kind == "cycles" then drawCycles()
+  elseif kind == "gaps" then drawGaps()
+  elseif kind == "report" then drawReport()
   elseif kind == "text" then drawText() end
 end
 
@@ -2377,6 +2946,8 @@ local function title()
   if kind == "graph" then return gv.src.folder .. " - " .. gv.src.fields[gv.fi].long end
   if kind == "cycles" then return "LSC Cycles - " .. periodText():lower() end
   if kind == "text" then return tv.title end
+  if kind == "gaps" then return "Time between cycles - " .. gapPeriod():lower() end
+  if kind == "report" then return "Storage Report" end
   return ""
 end
 
@@ -2396,6 +2967,7 @@ local function scroll(x, y, dir)
   if kind == "graph" and y >= TR0 then gv.scroll = gv.scroll - dir; drawTable(); return true end
   if kind == "cycles" and x < X0 + LXW and y > HY + 1 then cy.scroll = cy.scroll - dir; drawCycleRows(); return true end
   if kind == "text" then tv.scroll = tv.scroll - dir * 3; drawTextRows(); return true end
+  if kind == "gaps" and y > GTH then gp.scroll = gp.scroll - dir; drawGapTable(); return true end
 end
 
 local function key(code)
@@ -2408,6 +2980,10 @@ local function key(code)
     if code == 203 then monthStep(-1) elseif code == 205 then monthStep(1)
     elseif code == 200 then cy.scroll = cy.scroll - 1; drawCycleRows()
     elseif code == 208 then cy.scroll = cy.scroll + 1; drawCycleRows() end
+  elseif kind == "gaps" then
+    if code == 203 then gapStep(-1) elseif code == 205 then gapStep(1)
+    elseif code == 200 then gp.scroll = gp.scroll - 1; drawGapTable()
+    elseif code == 208 then gp.scroll = gp.scroll + 1; drawGapTable() end
   elseif kind == "text" then
     local d = ({ [200] = -1, [208] = 1, [201] = -TXH, [209] = TXH, [199] = -1e9, [207] = 1e9 })[code]
     if d then tv.scroll = tv.scroll + d; drawTextRows() end
@@ -2416,6 +2992,7 @@ end
 
 return {
   openGraph = openGraph, openCycles = openCycles, openText = openText,
+  openGaps = openGaps, openReport = openReport,
   draw = draw, title = title, tick = tick, scroll = scroll, key = key,
   isOpen = function() return kind ~= nil end,
   close = function() kind = nil end,
@@ -2920,10 +3497,12 @@ local function drawBrowse()
   tb("Open", 8, function() openEntry(sel and entries[sel]) end)
   tb("Graph", 9, graphHere)
   tb("Cycles", 10, function() VIEW.openCycles(); drawAll() end)
+  tb("Gaps", 8, function() VIEW.openGaps(); drawAll() end)
   x = x + 2
   tb("Properties", 14, properties)
   tb("Delete", 10, confirmDelete)
   tb("Disk Cleanup", 16, diskCleanup)
+  tb("Storage Report", 18, function() VIEW.openReport(); drawAll() end)
   -- address bar
   fill(X0, AY, CW, 1, K.face)
   text(X0 + 1, AY, "Address", K.black, K.face)
@@ -2975,6 +3554,8 @@ local function fileMenu()
     { "Open", function() openEntry(sel and entries[sel]) end },
     { "Graph", graphHere },
     { "Cycle Log", function() VIEW.openCycles() end },
+    { "Time Between Cycles", function() VIEW.openGaps() end },
+    { "Storage Report", function() VIEW.openReport() end },
     { "-" },
     { "Properties", properties },
     { "Delete...", confirmDelete },
@@ -3529,7 +4110,8 @@ sysAppOpen = function() return sysOpen end
 -- Start > Lock, or automatically after SETTINGS.lockMins idle minutes.
 -- Uses the overlay so every app keeps running underneath without drawing.
 LOCK = (function()
--- 6x12 bold font, ASCII 32-126, 12 rows of 2 hex digits per glyph (from X11 koi6x13b)
+-- 6x12 bold font, ASCII 32-126, 12 rows of 2 hex digits per glyph (from X11 koi6x13b;
+-- "M" and "m" redrawn so they read as letters instead of solid blocks)
 local F1 =
   "000000000000000000000000000c0c0c0c0c0c0c000c000000363636000000000000000000001e1e3f1e3f1e1e0000000000" ..
   "0c1e3c1e0f1e0c000000001b3f1e060c181e3f360000000000183c3c183f361f0000000c0c0c0000000000000000060c0c18" ..
@@ -3541,7 +4123,7 @@ local F1 =
   "00003f00003f000000000030180c0603060c18300000001e333303060c0c000c0000001e3333373f3f3e301f0000000c1e33" ..
   "33333f3333330000003e1b1b1b1e1b1b1b3e0000001e333030303030331e0000003e1b1b1b1b1b1b1b3e0000003f3030303e" ..
   "3030303f0000003f3030303e303030300000001e333030303733331e000000333333333f333333330000001e0c0c0c0c0c0c" ..
-  "0c1e0000000f030303030303331e0000003333363c383c36333300000030303030303030303f00000033333f3f3f33333333" ..
+  "0c1e0000000f030303030303331e0000003333363c383c36333300000030303030303030303f00000021333b353131313100" ..
   "000000333b3b3f3f373733330000001e333333333333331e0000003e3333333e303030300000001e3333333333333f1e0300" ..
   "003e3333333e3c3633330000001e3330301e0303331e0000003f0c0c0c0c0c0c0c0c00000033333333333333331e00000033" ..
   "3333331e1e1e0c0c000000333333333f3f3f3f3300000033331e1e0c1e1e333300000033331e1e0c0c0c0c0c0000003f0306" ..
@@ -3549,7 +4131,7 @@ local F1 =
   "000000000000000000000000000000003f00180c00000000000000000000000000001e031f33371b000000303030363b3333" ..
   "3b360000000000001e333030331e0000000303031b373333371b0000000000001e333f30301e0000000e1b18183e18181818" ..
   "0000000000001f36361c301e331e00303030363b333333330000000c0c001c0c0c0c0c1e0000000606000e0606060636361c" ..
-  "00303030363c383c36330000001c0c0c0c0c0c0c0c1e0000000000003e3f3f3f3f33000000000000363b3333333300000000" ..
+  "00303030363c383c36330000001c0c0c0c0c0c0c0c1e0000000000003c3635353535000000000000363b3333333300000000" ..
   "00001e333333331e000000000000363b333b36303030000000001b3733371b03030300000000363b30303030000000000000" ..
   "1e331c06331e0000000018183e1818181b0e00000000000033333333371b0000000000003333331e1e0c0000000000003333" ..
   "3f3f3f12000000000000331e0c0c1e33000000000000333333371b03331e000000003f060c18303f00000e1818180c380c18" ..
